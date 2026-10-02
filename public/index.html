@@ -132,6 +132,31 @@
             且不得与同展品未作废实测或其他停灯记录相交。失败会指出冲突且不保存。
           </p>
 
+          <h4>计划外照明事故（永久保留，不可修改/删除）</h4>
+          <p class="muted small">保管员登记<b>已发生</b>的计划外照明（无需属于任何计划）：填写墙上起止时间、
+            实际照度与必填原因。事故按自然年拆分并<b>始终按实际照度计入实际用光</b>；
+            与已批准/待复核计划开灯窗相交的部分替代相应计划估算（不释放计划排期），窗外部分单独计量。
+            事故与未作废实测（含草稿）、停灯、其他事故互斥。登记后若年度超额，超额仍生效，
+            相关年度仍有估算残余且尚未开始的已批准计划自动转「待复核」。登录用户只读。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>开始</th><th>结束</th><th>实际照度</th><th>事故原因</th><th>按年实际用光 lx·h（窗内替代 / 窗外单独）</th><th>登记人</th></tr></thead>
+            <tbody id="detail-incident-tbody"></tbody>
+          </table>
+          <form id="incident-form" class="inline-form conservator-only">
+            <span>登记已发生事故：</span>
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" required />
+            <span>至</span>
+            <input name="endDate" type="date" />
+            <input name="endTime" type="time" required />
+            <input name="actualLux" type="number" step="0.01" min="0.01" placeholder="实际照度 lx" required />
+            <input name="reason" maxlength="1000" placeholder="事故原因（必填）" required />
+            <button class="primary">登记事故</button>
+          </form>
+          <p class="muted small conservator-only">
+            起止无效、照度非正、原因缺失，或事故与同展品未作废实测（含草稿）、停灯、其他事故相交时拒绝保存并指出冲突。
+          </p>
+
           <h4>年度用光账册（封存后不可修改/覆盖）</h4>
           <p class="muted small">保管员可对<b>已结束的自然年</b>封存一份用光账册：原子记录当年上限、已确认实测、
             各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源（沿用固定时区与现有剂量口径）。

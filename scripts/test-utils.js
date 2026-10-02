@@ -121,4 +121,34 @@ test('停灯有效扣减 = 落在窗内部分再扣已确认实测覆盖（只�
   assert.strictEqual(mins, 120); // 10-11 与 12-13，共 2h
 });
 
+// 7) 计划外照明事故：窗内部分替代估算、窗外部分单独计量
+test('事故横跨计划开灯窗：窗内/窗外分钟各半，事故剂量仍全额计', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  // 事故 12:00-22:00（10h）：窗内 12-17（5h），窗外 17-22（5h）
+  const incident = { start: dosing.wallToTs('2026-03-01', 12 * 60), end: dosing.wallToTs('2026-03-01', 22 * 60) };
+  const inside = dosing.clipIntervalToWindows(incident, wins);
+  const outside = dosing.subtractIntervals([incident], inside);
+  const insideMin = inside.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  const outsideMin = outside.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  assert.strictEqual(insideMin, 300);
+  assert.strictEqual(outsideMin, 300);
+  // 计划残余 = 开灯窗 − 事故窗内部分（8h − 5h = 3h）
+  const residue = dosing.subtractIntervals(wins, inside);
+  const residueMin = residue.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  assert.strictEqual(residueMin, 180);
+  // 事故实际用光按自身照度全额计量（10h × 200lx = 2000 lx·h）
+  assert.strictEqual(dosing.doseByYear([incident], 200).get(2026), 2000);
+});
+
+test('事故完全在开灯窗外：窗内为 0，计划残余不被扣减，事故仍全额计量', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  const incident = { start: dosing.wallToTs('2026-03-01', 20 * 60), end: dosing.wallToTs('2026-03-01', 22 * 60) };
+  const inside = dosing.clipIntervalToWindows(incident, wins);
+  assert.strictEqual(inside.length, 0);
+  const residueMin = dosing.subtractIntervals(wins, inside)
+    .reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  assert.strictEqual(residueMin, 480);
+  assert.strictEqual(dosing.doseByYear([incident], 50).get(2026), 100);
+});
+
 console.log(`\n全部 ${passed} 项算法测试通过。`);

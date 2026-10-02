@@ -139,6 +139,27 @@ CREATE TABLE IF NOT EXISTS blackouts (
 CREATE INDEX IF NOT EXISTS idx_blackout_exhibit ON blackouts (exhibit_id, id);
 CREATE INDEX IF NOT EXISTS idx_blackout_plan ON blackouts (plan_id, id);
 
+-- 计划外照明事故（规则 17）：保管员登记“已发生”的计划外照明（实际用光，非估算）。
+-- 事故按墙上自然年拆分后始终计入实际用光；与已批准/待复核计划开灯窗相交的部分按实际照度
+-- 替代相应计划估算（计划残余中扣除该部分），窗外部分单独计量；不释放任何计划排期。
+-- 不变量（由登记/实测/停灯/纠错等核对共同保证）：
+--   * 起止为正时长、起点早于终点、结束不晚于登记当时、实际照度为正、原因必填；
+--   * 不与同展品任何未作废实测（含草稿）相交；
+--   * 不与同展品任何停灯记录相交；
+--   * 不与同展品其他照明事故相交。
+-- 事故一经写入永久保留：不提供修改/删除接口（计划取消/调整后记录仍保留，实际用光仍计入）。
+CREATE TABLE IF NOT EXISTS lighting_incidents (
+    id              BIGSERIAL PRIMARY KEY,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    actual_lux      NUMERIC(10,2) NOT NULL CHECK (actual_lux > 0),
+    reason          TEXT NOT NULL,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_incident_exhibit ON lighting_incidents (exhibit_id, id);
+
 -- 年度用光账册封存（保管员可对展品“已结束的自然年”封存一份不可变账册）。
 -- 封存时按当时的固定时区与统一剂量口径原子记录：
 --   当年上限、已确认实测剂量合计、各计划“开灯窗 − 已确认实测覆盖 − 本计划停灯”的估算残余、

@@ -140,6 +140,7 @@ function splitMinutesByYear(windows) {
     let cur = w.start;
     while (cur < w.end) {
       const year = yearOfTs(cur);
+      // 当前所在自然年的年末边界（墙上次年 1 月 1 日 00:00）
       const boundary = Date.UTC(year + 1, 0, 1) - config.tzOffsetMs;
       const segEnd = Math.min(w.end, boundary);
       add(year, (segEnd - cur) / 60000);

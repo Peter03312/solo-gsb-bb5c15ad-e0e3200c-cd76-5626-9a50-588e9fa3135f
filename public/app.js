@@ -209,10 +209,18 @@ function renderDetail() {
         实测 #${s.id}（计划 #${s.planId}）：${esc(s.start)} ~ ${esc(s.end)}，${s.lux} lx
         <div class="source-doses">已确认实测剂量：${yearlyText(s.yearly)}</div></div>`;
     }
+    if (s.kind === 'incident') {
+      const inside = Object.entries(s.yearlyInside || {}).map(([y, v]) => `${y}年 ${fmtN(v)}`).join('，') || '无';
+      const outside = Object.entries(s.yearlyOutside || {}).map(([y, v]) => `${y}年 ${fmtN(v)}`).join('，') || '无';
+      return `<div class="source-item incident">
+        计划外照明事故 #${s.id}：${esc(s.start)} ~ ${esc(s.end)}，${s.lux} lx，${esc(s.reason || '')}
+        <div class="source-doses">实际用光：${yearlyText(s.yearly)}
+          <div class="small muted">窗内替代估算：${inside}；窗外单独计量：${outside}</div></div></div>`;
+    }
     return `<div class="source-item plan ${s.status}">
       估算残余 · 计划 #${s.id}「${esc(s.title)}」${badge(s.status)}
       ：${esc(s.startDate)} ~ ${esc(s.endDate)}，每日 ${(s.periods || []).map(esc).join('、')}，${s.lux} lx
-      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖与停灯部分）</div></div>`;
+      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖、事故窗内部分与停灯部分）</div></div>`;
   }).join('') || '<p class="muted">暂无占用</p>';
 
   $('#detail-plan-tbody').innerHTML = d.plans.map(planRow).join('') ||
@@ -220,6 +228,7 @@ function renderDetail() {
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
   renderBlackouts(d);
+  renderIncidents(d);
   renderLedgers(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
@@ -263,7 +272,7 @@ function renderLedgers(d) {
           else if (it.zeroDifference) state = '<span class="tag zero">无差额</span>';
           else state = `<span class="tag ${it.delta > 0 ? 'up' : 'down'}">${it.delta > 0 ? '+' : ''}${fmtN(it.delta)}</span>`;
           return `<tr${!it.present ? ' class="over-row"' : ''}>
-            <td>${it.kind === 'measurement' ? '实测' : '估算残余'}</td>
+            <td>${it.kind === 'measurement' ? '实测' : it.kind === 'incident' ? '照明事故' : '估算残余'}</td>
             <td>#${it.id}</td>
             <td class="small">${esc(it.label)}</td>
             <td class="mono">${it.sealedDose === null ? '<span class="muted">—</span>' : fmtN(it.sealedDose)}</td>
@@ -283,6 +292,8 @@ function renderLedgers(d) {
             <td class="mono">${t && t.limit.currentDose !== null ? fmtN(t.limit.currentDose) : '—'}</td><td>${deltaCell(t && t.limit)}</td></tr>
           <tr><td>已确认实测合计</td><td class="mono">${fmtN(lg.confirmedTotal)}</td>
             <td class="mono">${t ? fmtN(t.confirmedTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.confirmedTotal)}</td></tr>
+          <tr><td>计划外照明事故合计</td><td class="mono">${fmtN(lg.incidentTotal || 0)}</td>
+            <td class="mono">${t ? fmtN(t.incidentTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.incidentTotal)}</td></tr>
           <tr><td>各计划估算残余合计</td><td class="mono">${fmtN(lg.residueTotal)}</td>
             <td class="mono">${t ? fmtN(t.residueTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.residueTotal)}</td></tr>
           <tr><td><b>合计</b></td><td class="mono"><b>${fmtN(lg.total)}</b></td>
@@ -376,6 +387,89 @@ $('#blackout-form')?.addEventListener('submit', async (e) => {
     } else {
       flash('error', err.message);
     }
+  }
+});
+
+/** 渲染计划外照明事故（逐条按年实际用光、窗内/窗外拆分）。 */
+function renderIncidents(d) {
+  const tbody = $('#detail-incident-tbody');
+  if (!tbody) return;
+  const incidents = d.incidents || [];
+  const splitText = (inc) => {
+    const years = new Set([
+      ...Object.keys(inc.yearly || {}),
+      ...Object.keys(inc.yearlyInside || {}),
+      ...Object.keys(inc.yearlyOutside || {}),
+    ]);
+    if (!years.size) return '无剂量';
+    return [...years].sort().map((y) => {
+      const total = fmtN((inc.yearly || {})[y] || 0);
+      const inside = fmtN((inc.yearlyInside || {})[y] || 0);
+      const outside = fmtN((inc.yearlyOutside || {})[y] || 0);
+      return `${y}年：${total}（窗内 ${inside} / 窗外 ${outside}）`;
+    }).join('，');
+  };
+  tbody.innerHTML = incidents.length ? incidents.map((x) => `<tr>
+      <td>${x.id}</td>
+      <td>${esc(x.start)}</td><td>${esc(x.end)}</td>
+      <td class="mono">${fmtN(x.actualLux)}</td>
+      <td>${esc(x.reason)}</td>
+      <td class="mono small">${splitText(x)}</td>
+      <td class="small">${esc(x.creatorName || '—')}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="7" class="muted">暂无计划外照明事故</td></tr>';
+}
+
+$('#incident-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  try {
+    const payload = {
+      exhibitId: state.detail.exhibit.id,
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime'),
+      endDate: fd.get('endDate') || fd.get('startDate'),
+      endTime: fd.get('endTime'),
+      actualLux: Number(fd.get('actualLux')),
+      reason: fd.get('reason'),
+    };
+    const detail = await api('POST', '/api/incidents', payload);
+    state.detail = detail;
+    e.target.reset();
+    renderDetail();
+    const dose = Object.entries(detail.incident.yearly || {})
+      .map(([y, v]) => `${y} 年 ${fmtN(v)} lx·h`).join('，');
+    flash('success', `计划外照明事故 #${detail.incident.id} 已登记并计入实际用光（${dose}）；记录保留、不可改删`);
+  } catch (err) {
+    if (err.status === 409 && err.data) {
+      // 超额仍生效（detail）或冲突未保存（details）两种 409
+      if (err.data.detail) {
+        state.detail = err.data.detail;
+        renderDetail();
+        const html = '<ul>' + (err.data.overflows || []).map((o) =>
+          `<li>${o.year} 年：登记后合计 ${fmtN(o.projected)}，<b>超额 ${fmtN(o.excess)} lx·h</b></li>`
+        ).join('') + '</ul>'
+          + (err.data.flaggedPlans && err.data.flaggedPlans.length
+            ? '<div>已转为待复核的计划：' + err.data.flaggedPlans.map((p) => `#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+            : '');
+        flash('warn', `事故 #${err.data.incident && err.data.incident.id} 已登记并计入实际用光，但造成超限`, html);
+        return;
+      }
+      if (err.data.details) {
+        const det = err.data.details;
+        const items = [];
+        (det.overlappingMeasurements || []).forEach((m) =>
+          items.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}）相交`));
+        (det.overlappingBlackouts || []).forEach((b) =>
+          items.push(`与停灯记录 #${b.id}（${esc(b.start)} ~ ${esc(b.end)}）相交`));
+        (det.overlappingIncidents || []).forEach((x) =>
+          items.push(`与其他计划外照明事故 #${x.id}（${esc(x.start)} ~ ${esc(x.end)}）相交`));
+        flash('error', err.message, items.length ? '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '');
+        return;
+      }
+    }
+    flash('error', err.message);
   }
 });
 

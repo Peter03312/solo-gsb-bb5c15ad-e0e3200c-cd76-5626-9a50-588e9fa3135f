@@ -107,6 +107,29 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
     - **封存与同展品占用变动并发**时，经同一展品键锁 + 行锁串行：账册只可能是变动前或变动后的
       **一致快照**，绝不混入变动前后的数据。
     - 既有查询字段与审批、实测接口**保持兼容**（展品详情仅附加 `ledgers` 字段）。
+17. **计划外照明事故（conservator only）**：保管员可按展品记录**已发生的计划外照明事故**，
+    填写**墙上起止时间、实际照度、必填原因**（事故无需属于任何计划）；登录用户可在展品详情查看
+    事故及按年剂量。
+    - **拒绝保存（指出冲突，不落库）**：起止无效（结束不晚于开始/非法日期时间）、**实际照度非正**、
+      **原因缺失**、结束时刻晚于当前（只能登记已发生事故）为 **400**；事故与同展品**未作废实测
+      （含待确认草稿）、停灯、其他事故**任一相交为 **409**，`details` 一次性列出
+      `overlappingMeasurements` / `overlappingBlackouts` / `overlappingIncidents` 全部冲突。
+    - **事故始终计入实际用光**：按现有时区跨自然年拆分，以事故**自身实际照度**全额计入年度占用
+      （不依赖任何计划）。
+    - **窗内替代估算、窗外单独计量、不释放排期**：事故与**已批准/待复核**计划开灯窗相交的部分，
+      按事故实际照度替代该计划相应估算（该部分从计划估算残余中扣除）；**窗外部分单独计量**。
+      计划之间“开灯窗是否相交”的排期判定**完全不变**（即使事故把某计划残余替代为 0，撞其开灯窗
+      的新计划/调整仍按重叠拒绝）。
+    - **后续操作不得与事故相交、统一口径**：后续实测录入/确认、实测纠错、停灯登记碰到事故时段
+      一律拒绝；**计划审批与复核、调整与成对核准、额度下调预演、展品占用与账册当前值**全部采用
+      同一口径（估算残余 = 开灯窗 − 已确认实测覆盖 − 本计划停灯 − **事故窗内部分**；
+      年度占用 = 已确认实测 + **事故实际用光** + 各计划估算残余）。
+    - 登记在**展品锁事务内重算**，**超额仍生效**：返回 **409** 报告超额年份/超额量，并把相关年度
+      **仍有估算残余且尚未开始**的已批准计划转**待复核**（原因注明由计划外照明事故触发，
+      `plan.flag_review_incident` 审计）；已开始计划不转状态，超额仍在年度表如实显示。
+    - 事故**永久保留，不可修改、不可删除**（`PUT/DELETE` 返回 400）；**已封存账册不回写**，
+      事故在账册对照中作为封存后新增来源（`incident:ID`）出现；既有响应字段保持兼容
+      （展品详情仅附加 `incidents` / `incidentDoseYearly`，占用来源仅附加 `kind:'incident'`）。
 
 ## 一键启动（Docker Compose）
 
@@ -211,8 +234,15 @@ npm run test:utils
     不与同展品其他未作废实测或停灯相交；通过后旧记录保留并标记作废、替代记录直接确认并互相关联，
     按自然年重算已确认实测与估算残余。若纠错造成年度超额，纠错仍生效，相关未开始已批准计划转待复核；
     占用下降不会自动恢复待复核计划。展品详情可追溯前后记录与纠错原因。
+13. 发生**计划外照明事故**（闭馆后未关灯、临时补光等）时，保管员在展品详情「计划外照明事故」处填写
+    **已发生**的墙上起止时间、实际照度与必填原因后登记：系统校验起止、照度、原因，并拒绝与未作废实测
+    （含草稿）、停灯、其他事故相交的时段（一次性指出全部冲突且不保存）。登记成功后事故按自然年拆分、
+    以实际照度**始终计入实际用光**；与已批准/待复核计划开灯窗相交的部分替代该计划估算（窗外部分单独
+    计量，不释放排期）。若因此超限，**事故仍生效**，相关年度仍有估算残余且尚未开始的已批准计划自动转
+    待复核（已开始计划不转，超额红色显示）。事故永久保留、不可改删；已封存账册原样保留，事故在账册
+    对照中作为封存后新增来源列出。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**、**年度账册封存**）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**实测纠错**、**年度账册封存**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -235,7 +265,7 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
 | `GET  /api/exhibits/:id/ledgers` | 登录 | 已封存年度账册列表；`?compare=1` 附按当前数据重算的对照差额 |
 | `POST /api/exhibits/:id/ledgers` | 保管员 | **封存某已结束自然年的用光账册**（原子快照）；未登记上限/年份未结束 400，重复封存 409 不覆盖旧账 |
 | `GET  /api/exhibits/:id/ledgers/:year` | 登录 | 某年封存账册 + 按当前数据重算值 + 上限/合计差额 + 按来源编号逐项差额（已消失来源仍列出，零差额标示） |
@@ -254,7 +284,9 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `POST /api/measurements/:id/correct` | 保管员 | **实测纠错**：原记录作废保留 + 替代记录确认，按自然年重算；超额 409 并转待复核 |
 | `GET /api/blackouts?exhibitId=&planId=` | 登录 | 停灯记录列表（布展员只读），逐条附 `yearly` 按年扣减量；另返回 `blackoutDeductionByExhibit` |
 | `POST /api/blackouts` | 保管员 | 登记已发生停灯时段；成功响应为展品详情（另附 `blackout`）；冲突 409 不保存 |
-| `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`） |
+| `GET /api/incidents?exhibitId=&planId=` | 登录 | **计划外照明事故**列表（登录可读，`planId` 过滤与该计划当前开灯窗相交的事故），逐条附按年实际用光及窗内/窗外拆分 |
+| `POST /api/incidents` | 保管员 | **登记已发生计划外照明事故**；成功（201）响应为展品详情（另附 `incident`）；事故致超限仍生效，返回 **409**（`overflows`/`flaggedPlans`/`detail`）；相交冲突 409 不保存 |
+| `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`、`incident.create`、`plan.flag_review_incident`） |
 
 ### 计划调整申请 `/api/adjustments`
 
@@ -677,6 +709,113 @@ curl -b cookies.txt -X DELETE http://localhost:3000/api/blackouts/1
 后续对停灯时段录入/确认实测同样被拒（409，`details.overlappingBlackoutId`）。
 调整申请/成对核准试算的 `conflicts.outsideBlackouts` 会列出落在拟改新窗之外的既有停灯。
 
+### 计划外照明事故 `/api/incidents`（保管员登记，登录可读）
+
+保管员按展品记录**已发生的计划外照明**（不要求属于任何计划）：墙上起止时间、实际照度、必填原因。
+布展员仅有只读权限；记录一经保存**永久保留、不可修改/删除**（`PUT/DELETE /api/incidents/:id` 返回 400）。
+
+登记校验：起点早于终点、**结束不晚于当前时间**、实际照度为正、原因必填（400）；事故不得与同展品
+**未作废实测（含待确认草稿）、停灯记录、其他事故**相交（409，一次性指出全部冲突，不保存）。
+
+事故剂量口径（全系统一致）：
+
+- 事故按墙上自然年拆分，以**自身实际照度**始终全额计入实际用光（`yearly`）；
+- 与已批准/待复核计划开灯窗相交部分（`yearlyInside`，附 `insidePlanIds`）替代相应计划估算，
+  从该计划估算残余中扣除；窗外部分（`yearlyOutside`）单独计量；
+- **不释放计划排期**：计划间开灯窗重叠判定不变（事故把残余替代为 0 也不允许其他计划撞窗）。
+
+请求体（起止可跨日、可跨年，墙上时间，与实测/停灯接口同形）：
+
+```json
+{
+  "exhibitId": 3,
+  "startDate": "2032-06-01",
+  "startTime": "18:00",
+  "endDate": "2032-06-02",
+  "endTime": "02:00",
+  "actualLux": 300,
+  "reason": "闭馆后展柜照明未关闭"
+}
+```
+
+curl 示例（保管员 Cookie 存于 cookies-custodian.txt）：
+
+```bash
+# 1) 保管员登记事故（成功 201：响应 = 更新后的展品详情，另附本次 incident）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/incidents \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibitId":3,"startDate":"2024-05-10","startTime":"12:00",
+       "endDate":"2024-05-10","endTime":"22:00",
+       "actualLux":200,"reason":"闭馆后展柜灯未关"}'
+
+# 2) 登录用户只读查询（按展品 / 按相交计划）
+curl -b cookies.txt 'http://localhost:3000/api/incidents?exhibitId=3'
+curl -b cookies.txt 'http://localhost:3000/api/incidents?planId=7'
+
+# 3) 布展员登记 -> 403；修改/删除 -> 400（事故记录保留）
+curl -b cookies.txt -X DELETE http://localhost:3000/api/incidents/1
+# {"error":"计划外照明事故记录保留，不可删除"}
+```
+
+成功响应中的事故对象（展品详情顶层 `incidents` 为全部记录、`incidentDoseYearly` 为各年事故实际用光汇总）：
+
+```json
+{
+  "id": 1,
+  "exhibitId": 3,
+  "start": "2024-05-10 12:00",
+  "end": "2024-05-10 22:00",
+  "actualLux": 200,
+  "reason": "闭柜后展柜灯未关",
+  "creatorName": "保管员（默认）",
+  "yearly": { "2024": 2000 },
+  "yearlyInside": { "2024": 1000 },
+  "yearlyOutside": { "2024": 1000 },
+  "insidePlanIds": [7]
+}
+```
+
+`yearly` 为事故实际用光按年剂量（始终全额）；`yearlyInside` 是与当前已批准/待复核计划开灯窗相交
+部分（替代计划估算），`yearlyOutside` 是窗外部分（单独计量）；计划取消后相交划分按当前占用计划
+重算，`yearly` 不变。
+
+相交冲突（409，**不保存**）一次性指出全部冲突：
+
+```json
+{
+  "error": "计划外照明事故登记失败：与待确认实测 #31（2024-05-10 09:00 ~ 2024-05-10 10:00）相交；与停灯记录 #2（计划「夜场」，2024-05-10 10:00 ~ 2024-05-10 11:00）相交；与其他计划外照明事故 #1（2024-05-10 12:30 ~ 2024-05-10 13:30）相交，未保存",
+  "details": {
+    "overlappingMeasurements": [
+      { "id": 31, "planId": 7, "status": "draft", "start": "2024-05-10 09:00", "end": "2024-05-10 10:00" }
+    ],
+    "overlappingBlackouts": [
+      { "id": 2, "planId": 7, "planTitle": "夜场", "start": "2024-05-10 10:00", "end": "2024-05-10 11:00" }
+    ],
+    "overlappingIncidents": [
+      { "id": 1, "start": "2024-05-10 12:30", "end": "2024-05-10 13:30" }
+    ]
+  }
+}
+```
+
+登记造成年度超额时（**事故仍已生效**，与确认实测同口径返回 409 并转待复核）：
+
+```json
+{
+  "message": "计划外照明事故 #5 已登记并计入实际用光，但登记后超限：2026 年超出 1000 lx·h。已将 1 条尚未开始的计划转为待复核",
+  "overflows": [{ "year": 2026, "limit": 1000, "projected": 2000, "excess": 1000 }],
+  "flaggedPlans": [
+    { "id": 9, "title": "未开始计划", "firstStart": "2026-12-20 09:00", "overflowYears": [2026] }
+  ],
+  "incident": { "id": 5, "yearly": { "2026": 1200 } },
+  "detail": { }
+}
+```
+
+后续实测录入/确认、实测纠错、停灯登记碰到事故时段一律 409（实测确认 `details.overlappingIncidentId`，
+录入/纠错/停灯登记 `details.overlappingIncidents`）。审计写入 `incident.create`（target 为事故编号，
+detail 含时段/照度/原因/按年剂量）与转复核事件 `plan.flag_review_incident`。
+
 ### 实测纠错 `/api/measurements/:id/correct`（保管员）
 
 保管员发现**已确认实测**的时段或照度录错时，用**原记录编号**（路径 `:id`）、**替代时段**、
@@ -802,12 +941,15 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 
 - `limit`：该年年度上限（封存时必须已登记，否则 400）；
 - `confirmedTotal`：该年**已确认实测**剂量合计（停灯不减实测）；
+- `incidentTotal`：该年**计划外照明事故**实际用光合计（事故始终按自身实际照度全额计入）；
+  事故功能上线前封存的旧账无此字段，读取时按 0 处理，总额列保持原样；
 - `residueTotal`：各**已批准/待复核**计划在该年的**估算残余**合计
-  （= 开灯窗 − 已确认实测覆盖 − 本计划停灯，按计划预计照度计）；
-- `total`：合计 = `confirmedTotal + residueTotal`；
-- `items`：**逐项来源**，`kind=measurement`（实测，含时段/照度/计划编号）或 `kind=plan`
+  （= 开灯窗 − 已确认实测覆盖 − 本计划停灯 − **事故窗内部分**，按计划预计照度计）；
+- `total`：合计 = `confirmedTotal + incidentTotal + residueTotal`；
+- `items`：**逐项来源**，`kind=measurement`（实测，含时段/照度/计划编号）、`kind=incident`
+  （计划外照明事故，含时段/实际照度/原因/窗内窗外拆分）或 `kind=plan`
   （计划估算残余，含名称/状态/展期/开灯时段/照度），每条带该年 `yearDose` 与稳定 `sourceKey`
-  （`measurement:ID` / `plan:ID`，供逐项差额对齐）。
+  （`measurement:ID` / `incident:ID` / `plan:ID`，供逐项差额对齐）。
 
 拒绝规则：布展员封存 → 403；年份非法/缺省 → 400；**该年未登记上限** → 400；
 **年份尚未结束**（墙上当前年份或未来年）→ 400；**该年已封存** → **409**（`details.existingLedgerId`），
@@ -904,8 +1046,8 @@ src/
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
-  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/ledgers（年度账册封存与对照）/audit 路由
+  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/incidents（计划外照明事故）/ledgers（年度账册封存与对照）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发）

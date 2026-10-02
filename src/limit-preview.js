@@ -33,7 +33,7 @@ function canonicalize(value) {
 /**
  * 根据当前占用快照生成指纹。指纹覆盖：该年既有上限、全部未作废实测（含草稿，
  * 草稿会影响重叠校验）、全部已批准/待复核计划的状态/计划字段/在该年的估算残余、
- * 全部停灯记录及其按年扣减量。
+ * 全部停灯记录及其按年扣减量、全部计划外照明事故及其按年实际剂量（含窗内/窗外拆分）。
  * 计划是否“已开始”只在跨越各自首次开灯时刻时才变化，调用方把此刻已开始的计划 id
  * 列表（startedPlanIds）放入快照即可完整表达该时间相关状态，避免直接比较毫秒时间戳。
  */
@@ -43,6 +43,7 @@ function fingerprintSnapshot(snapshot) {
     measurements: snapshot.measurements,
     plans: snapshot.plans,
     blackouts: snapshot.blackouts || [],
+    incidents: snapshot.incidents || [],
     startedPlanIds: snapshot.startedPlanIds,
   };
   return crypto.createHash('sha256').update(canonicalize(payload)).digest('hex');

@@ -12,7 +12,10 @@
  *       下调年度上限的预演/凭证提交、占用变化拒绝并返回新结果、旧接口同事务即时重算、
  *       未开始计划转待复核（写明原因）、已开始计划保留且超额如实显示、
  *       实测纠错（替代仍属原计划、越窗/相交/非法数值拒绝、旧记录作废保留+替代确认+双向关联、
- *                 自然年重算、纠错超额转待复核、占用下降不恢复待复核、链式纠错、取消计划后纠错）。
+ *                 自然年重算、纠错超额转待复核、占用下降不恢复待复核、链式纠错、取消计划后纠错）、
+ *       计划外照明事故（登记校验/三类相交冲突一次性指出且不保存、窗内替代估算/窗外单独计量/不释放排期、
+ *                 跨年拆分、后续实测/停灯/纠错互斥、超额仍生效转待复核、已开始计划不转、
+ *                 下调预演指纹含事故、已封存账册不回写与新增来源对照、调整口径、不可改删/越权）。
  */
 
 process.env.SEED_DEMO = 'false';
@@ -566,22 +569,22 @@ async function runFlow() {
     periods: ['09:00-17:00'], estimatedLux: 200,
   }, 'i');
   assert(r.status === 201, '提交超额调整 adj7');
-  const adj7 = r.body.adjustment.id;
+  const inAdjId = r.body.adjustment.id;
   assert(r.body.adjustment.preview.ok === false &&
     r.body.adjustment.preview.conflicts.overflows[0].year === 2030,
     '试算指出超额年份 2030');
-  r = await call('POST', `/api/adjustments/${adj7}/approve`, {}, 'c');
+  r = await call('POST', `/api/adjustments/${inAdjId}/approve`, {}, 'c');
   assert(r.status === 409, '超额调整批准被拒（409）');
   const o = r.body.details.conflicts.overflows.find((x) => x.year === 2030);
   assert(o && o.limit === 800 && o.newResidue === 1600 && o.projected === 1600 &&
     o.excess === 800, `超额明细数值正确：${JSON.stringify(o)}`);
   r = await call('GET', `/api/plans/${planC}`, null, 'i');
   assert(r.body.plan.estimated_lux === 50, '核对失败不改变计划（照度仍 50）');
-  assert(r.body.plan.pendingAdjustment && r.body.plan.pendingAdjustment.id === adj7,
+  assert(r.body.plan.pendingAdjustment && r.body.plan.pendingAdjustment.id === inAdjId,
     '超额申请保持待审');
   // 提额后重新核对通过（同一份申请无需撤回重提）
   await call('POST', `/api/exhibits/${ex3}/limits`, { year: 2030, limitLxh: 2000 }, 'c');
-  r = await call('POST', `/api/adjustments/${adj7}/approve`, {}, 'c');
+  r = await call('POST', `/api/adjustments/${inAdjId}/approve`, {}, 'c');
   assert(r.status === 200, '提额后同一待审申请批准通过');
   r = await call('GET', `/api/plans/${planC}`, null, 'i');
   assert(r.body.plan.estimated_lux === 200, '计划照度更新为拟改值 200');
@@ -2166,6 +2169,310 @@ async function runFlow() {
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.body.events.some((e) => e.action === 'ledger.seal' &&
     Number(e.target_id) === ledgerId), '操作流水记录了账册封存');
+
+  // ===========================================================================
+  // 规则 17：计划外照明事故
+  // ===========================================================================
+
+  // ---- 事故：窗内部分替代计划估算，窗外部分单独计量，不释放排期 ----
+  const exIn = await createExhibit('计划外事故展品');
+  await call('POST', `/api/exhibits/${exIn}/limits`, { year: 2024, limitLxh: 5000 }, 'c');
+  const inPlan = await submitPlan(exIn, '事故窗内计划', '2024-05-10', '2024-05-10',
+    ['09:00-17:00'], 100); // 毛估算 800
+  await approvePlan(inPlan);
+
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn,
+    startDate: '2024-05-10', startTime: '12:00',
+    endDate: '2024-05-10', endTime: '22:00',
+    actualLux: 200, reason: '闭馆后展柜灯未关',
+  }, 'c');
+  assert(r.status === 201, '登记跨窗外的照明事故');
+  const inc1 = r.body.incident;
+  // 事故 12:00-22:00 = 10h × 200 = 2000；窗内 12:00-17:00 = 5h × 200 = 1000；窗外 5h = 1000
+  assert(inc1.yearly[2024] === 2000 && inc1.yearlyInside[2024] === 1000 &&
+    inc1.yearlyOutside[2024] === 1000 && inc1.insidePlanIds.length === 1,
+    '事故按年剂量与窗内/窗外拆分正确');
+
+  r = await call('GET', `/api/exhibits/${exIn}`, null, 'i');
+  // 占用：事故 2000 + 计划残余（毛800 − 窗内5h×100=300）= 2300
+  assert(r.body.years[2024].used === 2300,
+    `事故窗内部分替代估算、窗外部分单独计量（实际 2300，实际=${r.body.years[2024].used}）`);
+  const incSrc = r.body.sources.find((s) => s.kind === 'incident' && s.id === inc1.id);
+  assert(incSrc && incSrc.yearly[2024] === 2000, '占用来源含事故条目');
+  const inPlanSrc = r.body.sources.find((s) => s.kind === 'plan' && s.id === inPlan);
+  assert(inPlanSrc.yearly[2024] === 300, '计划估算残余已扣除事故窗内部分（300）');
+  assert(r.body.incidentDoseYearly[2024] === 2000 && r.body.incidents.length === 1,
+    '展品详情附事故列表与各年事故实际用光汇总');
+
+  r = await call('GET', `/api/incidents?exhibitId=${exIn}`, null, 'i');
+  assert(r.status === 200 && r.body.incidents.length === 1 &&
+    r.body.incidents[0].yearly[2024] === 2000, '登录用户可查询事故列表');
+  r = await call('GET', `/api/incidents?planId=${inPlan}`, null, 'i');
+  assert(r.body.incidents.length === 1, '可按计划过滤（与计划窗相交的事故）');
+
+  // ---- 非法输入 400：起止无效 / 照度非正 / 原因缺失 / 未来结束时刻 ----
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2024-05-11', startTime: '12:00',
+    endDate: '2024-05-11', endTime: '12:00', actualLux: 100, reason: 'x',
+  }, 'c');
+  assert(r.status === 400 && /起点须早于终点/.test(r.body.error), '零时长事故 400');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2024-05-11', startTime: '10:00',
+    endDate: '2024-05-11', endTime: '09:00', actualLux: 100, reason: 'x',
+  }, 'c');
+  assert(r.status === 400, '起止倒置 400');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2024-05-11', startTime: '10:00',
+    endDate: '2024-05-11', endTime: '11:00', actualLux: 0, reason: 'x',
+  }, 'c');
+  assert(r.status === 400 && /正数/.test(r.body.error), '非正照度 400');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2024-05-11', startTime: '10:00',
+    endDate: '2024-05-11', endTime: '11:00', actualLux: 100, reason: '   ',
+  }, 'c');
+  assert(r.status === 400 && /原因/.test(r.body.error), '原因缺失 400');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2099-05-11', startTime: '10:00',
+    endDate: '2099-05-11', endTime: '11:00', actualLux: 100, reason: 'x',
+  }, 'c');
+  assert(r.status === 400 && /只能登记已发生/.test(r.body.error), '未来事故 400');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: 999999, startDate: '2024-05-11', startTime: '10:00',
+    endDate: '2024-05-11', endTime: '11:00', actualLux: 100, reason: 'x',
+  }, 'c');
+  assert(r.status === 400 && /展品不存在/.test(r.body.error), '不存在展品 400');
+
+  // ---- 冲突 409：与未作废实测（含草稿）/ 停灯 / 其他事故相交，一次性指出且不保存 ----
+  // 先在计划窗内录一条草稿实测 09:00-10:00
+  r = await call('POST', '/api/measurements', {
+    planId: inPlan, startDate: '2024-05-10', startTime: '09:00',
+    endDate: '2024-05-10', endTime: '10:00', actualLux: 50,
+  }, 'c');
+  assert(r.status === 201, '录入草稿实测（与后续事故冲突用）');
+  // 登记一条停灯 2024-05-10 10:00-11:00（窗内，不与草稿/事故1相交）
+  r = await call('POST', '/api/blackouts', {
+    planId: inPlan, startDate: '2024-05-10', startTime: '10:00',
+    endDate: '2024-05-10', endTime: '11:00', reason: '检修',
+  }, 'c');
+  assert(r.status === 201, '登记停灯（与后续事故冲突用）');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn,
+    startDate: '2024-05-10', startTime: '09:30',
+    endDate: '2024-05-10', endTime: '12:30',
+    actualLux: 300, reason: '同时撞三类',
+  }, 'c');
+  assert(r.status === 409, '事故与草稿实测/停灯/既有事故相交 -> 409');
+  assert(r.body.details.overlappingMeasurements.length === 1, 'details 指出冲突实测（含草稿）');
+  assert(r.body.details.overlappingBlackouts.length === 1, 'details 指出冲突停灯');
+  assert(r.body.details.overlappingIncidents.length === 1, 'details 指出冲突事故');
+  r = await call('GET', `/api/incidents?exhibitId=${exIn}`, null, 'i');
+  assert(r.body.incidents.length === 1, '冲突事故未保存');
+
+  // ---- 后续实测录入/确认、停灯登记、实测纠错均不得与事故相交 ----
+  r = await call('POST', '/api/measurements', {
+    planId: inPlan, startDate: '2024-05-10', startTime: '16:00',
+    endDate: '2024-05-10', endTime: '16:30', actualLux: 90,
+  }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingIncidentId === inc1.id,
+    '录入与事故相交的实测 -> 409');
+  r = await call('POST', '/api/blackouts', {
+    planId: inPlan, startDate: '2024-05-10', startTime: '16:00',
+    endDate: '2024-05-10', endTime: '16:30', reason: '撞事故',
+  }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingIncidents.length === 1,
+    '登记与事故相交的停灯 -> 409');
+
+  // ---- 事故不可改删；布展员不能登记 ----
+  r = await call('DELETE', `/api/incidents/${inc1.id}`, {}, 'c');
+  assert(r.status === 400 && /不可删除/.test(r.body.error), '事故不可删除');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn, startDate: '2024-05-11', startTime: '10:00',
+    endDate: '2024-05-11', endTime: '11:00', actualLux: 100, reason: 'x',
+  }, 'i');
+  assert(r.status === 403, '布展员不能登记事故');
+
+  // ---- 事故不释放排期：事故替代估算但不改变计划间开灯窗重叠判定 ----
+  const exRel = await createExhibit('事故不释放排期展品');
+  await call('POST', `/api/exhibits/${exRel}/limits`, { year: 2024, limitLxh: 50000 }, 'c');
+  const relA = await submitPlan(exRel, '排期计划A', '2024-07-01', '2024-07-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(relA);
+  // 已发生事故完整覆盖 A 的窗（事故不释放 A 的排期）
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exRel, startDate: '2024-07-01', startTime: '09:00',
+    endDate: '2024-07-01', endTime: '17:00', actualLux: 100, reason: '事故覆盖A',
+  }, 'c');
+  assert(r.status === 201, '事故完整覆盖计划 A（A 的估算残余变为 0，但排期仍占用）');
+  r = await call('GET', `/api/exhibits/${exRel}`, null, 'i');
+  const relASrc = r.body.sources.find((x) => x.kind === 'plan' && x.id === relA);
+  assert((relASrc.yearly[2024] || 0) === 0, 'A 的估算残余为 0（被事故完全替代）');
+  // 事故后新建一条撞 A 开灯窗的计划：提交即被拒（A 残余为 0 但排期不释放）
+  r = await call('POST', '/api/plans', {
+    exhibitId: exRel, title: '排期计划C', startDate: '2024-07-01', endDate: '2024-07-01',
+    periods: ['14:00-15:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 409 && /开灯时间重叠/.test(r.body.error) &&
+    r.body.details.overlappingPlanId === relA,
+    '事故不释放计划排期：撞 A 窗的新计划提交即拒绝（即使 A 残余为 0）');
+
+  // ---- 批准口径含事故实际用光：事故占用额度基数，窗内部分替代本计划估算 ----
+  const exIn2 = await createExhibit('事故替代估算展品');
+  await call('POST', `/api/exhibits/${exIn2}/limits`, { year: 2024, limitLxh: 1000 }, 'c');
+  // 事故 09:00-12:00（200 lx = 600），提交计划 09:00-17:00 100lx（毛800）：
+  // 窗内 3h 被事故替代，本计划残余 = 5h×100 = 500；事故 600 作为其他占用基数
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn2, startDate: '2024-06-01', startTime: '09:00',
+    endDate: '2024-06-01', endTime: '12:00', actualLux: 200, reason: '白天意外补光',
+  }, 'c');
+  assert(r.status === 201, '登记事故 600（未超额）');
+  const pInside = await submitPlan(exIn2, '与事故窗相交的计划', '2024-06-01', '2024-06-01',
+    ['09:00-17:00'], 100);
+  r = await call('POST', `/api/plans/${pInside}/approve`, {}, 'c');
+  assert(r.status === 409,
+    '事故 600 作为占用基数 + 本计划残余 500 = 1100 > 1000，批准拒绝');
+  assert(r.body.details.overflows[0].year === 2024 &&
+    r.body.details.overflows[0].usedBefore === 600 &&
+    r.body.details.overflows[0].addedByThisPlan === 500,
+    '超额明细：其他占用（事故）600、本计划残余 500（窗内 3h 已被事故替代，不重复计）');
+  // 把上限提高到 1100 后可批准
+  await call('POST', `/api/exhibits/${exIn2}/limits`, { year: 2024, limitLxh: 1100 }, 'c');
+  r = await call('POST', `/api/plans/${pInside}/approve`, {}, 'c');
+  assert(r.status === 200, '事故窗内部分替代估算：上限提到 1100 后可批准');
+  r = await call('GET', `/api/exhibits/${exIn2}`, null, 'i');
+  assert(r.body.years[2024].used === 1100,
+    `批准后占用 = 事故 600 + 计划残余 500 = 1100（实际=${r.body.years[2024].used}）`);
+
+  // ---- 事故跨年：按墙上自然年拆分 ----
+  const exIn3 = await createExhibit('事故跨年展品');
+  await call('POST', `/api/exhibits/${exIn3}/limits`, { year: 2024, limitLxh: 50000 }, 'c');
+  await call('POST', `/api/exhibits/${exIn3}/limits`, { year: 2025, limitLxh: 50000 }, 'c');
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn3, startDate: '2024-12-31', startTime: '20:00',
+    endDate: '2025-01-01', endTime: '04:00', actualLux: 100, reason: '跨年通宵意外照明',
+  }, 'c');
+  assert(r.status === 201, '登记跨年事故');
+  const incY = r.body.incident;
+  assert(incY.yearly[2024] === 400 && incY.yearly[2025] === 400,
+    `事故按墙上自然年拆分（2024=400,2025=400，实际=${JSON.stringify(incY.yearly)}）`);
+
+  // ---- 登记事故超额仍生效：报告超额年份，未开始且仍有残余的已批准计划转待复核 ----
+  // 当前墙上时间为 2026-10：用 2026 年内“已发生”的事故 + 同年“尚未开始”的已批准计划。
+  const exIn4 = await createExhibit('事故超额转复核展品');
+  await call('POST', `/api/exhibits/${exIn4}/limits`, { year: 2026, limitLxh: 1000 }, 'c');
+  const inFuturePlan = await submitPlan(exIn4, '事故后待转复核计划', '2026-12-20', '2026-12-20',
+    ['09:00-17:00'], 100); // 800，尚未开始
+  await approvePlan(inFuturePlan);
+  // 已发生事故：2026-10-01 09:00-12:00（窗外，与 12 月计划不相交），3h×400 = 1200
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn4, startDate: '2026-10-01', startTime: '09:00',
+    endDate: '2026-10-01', endTime: '12:00', actualLux: 400, reason: '事故致超额',
+  }, 'c');
+  // 2026：事故 1200 + 计划残余 800 = 2000 > 1000，超额 1000；计划尚未开始 -> 转待复核
+  assert(r.status === 409, '事故登记后超额返回 409（事故仍生效）');
+  assert(r.body.overflows.some((o) => o.year === 2026 && o.excess === 1000),
+    `超额年份与超额量正确（实际=${JSON.stringify(r.body.overflows)}）`);
+  assert(r.body.flaggedPlans.length === 1 && r.body.flaggedPlans[0].id === inFuturePlan,
+    '相关年度仍有估算残余且尚未开始的已批准计划转待复核');
+  r = await call('GET', `/api/plans/${inFuturePlan}`, null, 'i');
+  assert(r.body.plan.status === 'pending_review' && /照明事故/.test(r.body.plan.review_reason),
+    '计划状态已转待复核且原因注明事故触发');
+  // 已开始的已批准计划不转状态：事故超额时只转未开始计划
+  const exIn4b = await createExhibit('事故超额已开始计划展品');
+  await call('POST', `/api/exhibits/${exIn4b}/limits`, { year: 2024, limitLxh: 50000 }, 'c');
+  await call('POST', `/api/exhibits/${exIn4b}/limits`, { year: 2026, limitLxh: 100 }, 'c');
+  const startedPlan = await submitPlan(exIn4b, '已开始计划', '2024-08-01', '2024-08-01',
+    ['09:00-10:00'], 100);
+  await approvePlan(startedPlan);
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn4b, startDate: '2026-10-01', startTime: '13:00',
+    endDate: '2026-10-01', endTime: '14:00', actualLux: 200, reason: '事故超额',
+  }, 'c');
+  assert(r.status === 409 && r.body.flaggedPlans.length === 0,
+    '已开始计划不因事故超额转待复核（超额仍在年度表如实显示）');
+  // 审计保留
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.some((e) => e.action === 'incident.create'), '审计含 incident.create');
+  assert(r.body.events.some((e) => e.action === 'plan.flag_review_incident'),
+    '审计含 plan.flag_review_incident');
+
+  // ---- 上限下调预演口径含事故，且事故变化使旧预演凭证失效 ----
+  const exIn5 = await createExhibit('事故预演展品');
+  await call('POST', `/api/exhibits/${exIn5}/limits`, { year: 2024, limitLxh: 5000 }, 'c');
+  r = await call('POST', `/api/exhibits/${exIn5}/limits/preview`,
+    { year: 2024, limitLxh: 400 }, 'c');
+  assert(r.status === 200 && r.body.preview.used === 0, '预演初始占用 0');
+  const pvToken = r.body.preview.token;
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn5, startDate: '2024-03-01', startTime: '09:00',
+    endDate: '2024-03-01', endTime: '10:00', actualLux: 500, reason: '预演后新增事故',
+  }, 'c');
+  assert(r.status === 201, '预演后登记事故');
+  r = await call('POST', `/api/exhibits/${exIn5}/limits/lower`,
+    { year: 2024, limitLxh: 400, token: pvToken }, 'c');
+  assert(r.status === 409 && r.body.details.preview.used === 500,
+    '事故变化使旧预演凭证失效：409 并返回最新核算（used=500）');
+
+  // ---- 已封存账册不因登记事故回写；对照中事故为封存后新增来源 ----
+  const exIn6 = await createExhibit('事故账册展品');
+  await call('POST', `/api/exhibits/${exIn6}/limits`, { year: 2024, limitLxh: 5000 }, 'c');
+  const lgPlan = await submitPlan(exIn6, '账册计划', '2024-04-01', '2024-04-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(lgPlan);
+  r = await call('POST', `/api/exhibits/${exIn6}/ledgers`, { year: 2024 }, 'c');
+  assert(r.status === 201, '先封存 2024 账册');
+  const sealedId = r.body.ledger.id;
+  const sealedBefore = r.body.ledger;
+  assert(sealedBefore.incidentTotal === 0 && sealedBefore.total === 800,
+    '封存时无事故：事故合计 0、总额 800');
+  // 封存后登记事故（窗内 1h：09-10）
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn6, startDate: '2024-04-01', startTime: '09:00',
+    endDate: '2024-04-01', endTime: '10:00', actualLux: 300, reason: '封存后发现的事故',
+  }, 'c');
+  assert(r.status === 201, '封存后仍可登记事故（已封存账册不回写）');
+  r = await call('GET', `/api/exhibits/${exIn6}/ledgers/2024`, null, 'i');
+  assert(r.body.ledger.id === sealedId && r.body.ledger.total === 800 &&
+    r.body.ledger.incidentTotal === 0, '已封存账册保持原样不回写');
+  // 当前重算：事故 300；计划残余 800 − 1h×100 = 700；合计 1000
+  assert(r.body.current.incidentTotal === 300 && r.body.current.residueTotal === 700 &&
+    r.body.current.total === 1000,
+    `当前重算含事故（incident=300,residue=700,total=1000，实际=${JSON.stringify({
+      i: r.body.current.incidentTotal, rs: r.body.current.residueTotal, t: r.body.current.total })}）`);
+  const incDiff = r.body.comparison.itemDiffs.find((d) => d.kind === 'incident');
+  assert(incDiff && incDiff.sealed === false && incDiff.present === true &&
+    incDiff.currentDose === 300, '事故作为封存后新增来源逐项列出');
+  const planDiff = r.body.comparison.itemDiffs.find((d) => d.kind === 'plan');
+  assert(planDiff.delta === -100, '被事故窗内部分替代的计划残余差额 -100');
+
+  // ---- 调整/成对/批准口径均含事故窗内扣减（用未来计划在新展品验证）----
+  const exIn7 = await createExhibit('事故调整口径展品');
+  await call('POST', `/api/exhibits/${exIn7}/limits`, { year: 2024, limitLxh: 50000 }, 'c');
+  await call('POST', `/api/exhibits/${exIn7}/limits`, { year: 2030, limitLxh: 50000 }, 'c');
+  // 已发生事故（2024 窗外）；再登记一条 2030 不可行（未来），故窗内扣减改用以下方式：
+  // 事故只能是已发生时段 -> 2030 未开始计划不可能与已发生事故同窗。
+  // 因此调整路径的事故窗内扣减由“窗外事故不影响未来残余” + 占用基数含事故共同保证，
+  // 这里验证：未来计划的调整试算/批准正常，且 2024 事故始终计入占用、不释放任何排期。
+  const adjPlan = await submitPlan(exIn7, '待调整计划', '2030-03-01', '2030-03-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(adjPlan);
+  r = await call('POST', '/api/incidents', {
+    exhibitId: exIn7, startDate: '2024-09-01', startTime: '09:00',
+    endDate: '2024-09-01', endTime: '10:00', actualLux: 500, reason: '过去窗外事故',
+  }, 'c');
+  assert(r.status === 201, '登记窗外事故（500，2024 年）');
+  r = await call('POST', '/api/adjustments', {
+    planId: adjPlan, startDate: '2030-03-02', endDate: '2030-03-02',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201 && r.body.adjustment.preview.newResidueYearly[2030] === 800,
+    '未来计划调整试算：窗外事故不影响其残余（仍 800）');
+  const incAdjId = r.body.adjustment.id;
+  r = await call('POST', `/api/adjustments/${incAdjId}/approve`, {}, 'c');
+  assert(r.status === 200, '调整批准不受窗外事故影响');
+  r = await call('GET', `/api/exhibits/${exIn7}`, null, 'i');
+  assert(r.body.years[2024].used === 500 && r.body.years[2030].used === 800,
+    '事故 500 始终计入 2024 实际用光，2030 计划残余不变');
 }
 
 main().catch((err) => {
