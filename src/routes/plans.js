@@ -27,6 +27,7 @@ const {
   yearMapToObject,
   buildWindows,
   subtractIntervals,
+  clipIntervalToWindows,
 } = require('../dosing');
 const { ConflictError, AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
@@ -375,7 +376,7 @@ async function approve(req, res) {
       );
     }
 
-    // 2) 年度额度检查（本计划估算残余 = 自身实测与停灯已覆盖之外的部分，统一扣减口径）
+    // 2) 年度额度检查（本计划估算残余 = 自身实测、停灯、窗内计划外事故已覆盖之外的部分，统一扣减口径）
     const occupancy = await computeOccupancy(client, plan.exhibit_id, { excludePlanId: id });
     const { rows: measRows } = await client.query(
       `SELECT start_ts, end_ts FROM measurements WHERE plan_id = $1 AND status = 'confirmed'`,
@@ -393,7 +394,24 @@ async function approve(req, res) {
       start: new Date(b.start_ts).getTime(),
       end: new Date(b.end_ts).getTime(),
     }));
-    const remainingWindows = subtractIntervals(targetWindows, [...selfMeas, ...selfBlackouts]);
+    // 窗内计划外照明事故：相交部分已按事故实际用光计量，从本计划估算残余中扣除
+    const { rows: incidentRows } = await client.query(
+      `SELECT start_ts, end_ts FROM light_incidents
+        WHERE exhibit_id = $1
+          AND start_ts < $3 AND end_ts > $2
+        ORDER BY id`,
+      [plan.exhibit_id,
+        new Date(Math.min(...targetWindows.map((w) => w.start))),
+        new Date(Math.max(...targetWindows.map((w) => w.end)))]
+    );
+    const selfIncidentParts = [];
+    for (const r of incidentRows) {
+      const hole = { start: new Date(r.start_ts).getTime(), end: new Date(r.end_ts).getTime() };
+      for (const part of clipIntervalToWindows(hole, targetWindows)) selfIncidentParts.push(part);
+    }
+    const remainingWindows = subtractIntervals(
+      targetWindows, [...selfMeas, ...selfBlackouts, ...selfIncidentParts]
+    );
     const addedYearly = yearMapToObject(doseByYear(remainingWindows, Number(plan.estimated_lux)));
 
     const overflows = buildOverflows(occupancy.used, occupancy.limits, addedYearly);

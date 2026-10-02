@@ -14,6 +14,7 @@ const planRoutes = require('./routes/plans');
 const adjustmentRoutes = require('./routes/adjustments');
 const measurementRoutes = require('./routes/measurements');
 const blackoutRoutes = require('./routes/blackouts');
+const incidentRoutes = require('./routes/incidents');
 const ledgerRoutes = require('./routes/ledgers');
 const auditRoutes = require('./routes/audit');
 
@@ -32,6 +33,7 @@ function createApp() {
   app.use('/api/adjustments', adjustmentRoutes);
   app.use('/api/measurements', measurementRoutes);
   app.use('/api/blackouts', blackoutRoutes.router);
+  app.use('/api/incidents', incidentRoutes.router);
   app.use('/api/exhibits/:id/ledgers', ledgerRoutes);
   app.use('/api/audit', auditRoutes);
 

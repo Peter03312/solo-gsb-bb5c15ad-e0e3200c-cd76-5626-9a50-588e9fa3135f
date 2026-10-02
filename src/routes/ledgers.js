@@ -116,6 +116,7 @@ router.get('/:year', async (req, res, next) => {
         year: result.current.year,
         limit: result.current.limit,
         confirmedTotal: result.current.confirmedTotal,
+        incidentTotal: result.current.incidentTotal,
         residueTotal: result.current.residueTotal,
         total: result.current.total,
         items: result.current.items,

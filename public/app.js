@@ -209,10 +209,15 @@ function renderDetail() {
         实测 #${s.id}（计划 #${s.planId}）：${esc(s.start)} ~ ${esc(s.end)}，${s.lux} lx
         <div class="source-doses">已确认实测剂量：${yearlyText(s.yearly)}</div></div>`;
     }
+    if (s.kind === 'incident') {
+      return `<div class="source-item measurement">
+        计划外照明事故 #${s.id}：${esc(s.start)} ~ ${esc(s.end)}，实际 ${s.lux} lx，原因：${esc(s.reason || '')}
+        <div class="source-doses">事故实际用光（始终计入；窗内部分替代估算、窗外单独计量，不释放排期）：${yearlyText(s.yearly)}</div></div>`;
+    }
     return `<div class="source-item plan ${s.status}">
       估算残余 · 计划 #${s.id}「${esc(s.title)}」${badge(s.status)}
       ：${esc(s.startDate)} ~ ${esc(s.endDate)}，每日 ${(s.periods || []).map(esc).join('、')}，${s.lux} lx
-      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖与停灯部分）</div></div>`;
+      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖、停灯与计划外事故部分）</div></div>`;
   }).join('') || '<p class="muted">暂无占用</p>';
 
   $('#detail-plan-tbody').innerHTML = d.plans.map(planRow).join('') ||
@@ -220,6 +225,7 @@ function renderDetail() {
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
   renderBlackouts(d);
+  renderIncidents(d);
   renderLedgers(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
@@ -376,6 +382,75 @@ $('#blackout-form')?.addEventListener('submit', async (e) => {
     } else {
       flash('error', err.message);
     }
+  }
+});
+
+/** 渲染计划外照明事故：逐条附实际按年用光与对各计划估算的替代。 */
+function renderIncidents(d) {
+  const tbody = $('#detail-incident-tbody');
+  if (!tbody) return;
+  const incidents = d.incidents || [];
+  tbody.innerHTML = incidents.length ? incidents.map((x) => {
+    const repl = (x.replacements || []).map((rp) =>
+      `<div class="small muted">窗内替代计划 #${rp.planId}「${esc(rp.title || '')}」估算：${yearlyText(rp.yearly)}</div>`
+    ).join('');
+    return `<tr>
+      <td>${x.id}</td>
+      <td>${esc(x.start)}</td><td>${esc(x.end)}</td>
+      <td class="mono">${fmtN(x.actualLux)}</td>
+      <td>${esc(x.reason)}${repl}</td>
+      <td class="mono">${yearlyText(x.yearly)}</td>
+      <td class="small">${esc(x.creatorName || '—')}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="muted">暂无计划外照明事故</td></tr>';
+}
+
+$('#incident-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  try {
+    const detail = await api('POST', '/api/incidents', {
+      exhibitId: state.detail.exhibit.id,
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime'),
+      endDate: fd.get('endDate') || fd.get('startDate'),
+      endTime: fd.get('endTime'),
+      actualLux: Number(fd.get('actualLux')),
+      reason: fd.get('reason'),
+    });
+    state.detail = detail;
+    e.target.reset();
+    renderDetail();
+    const ded = Object.entries(detail.incident.yearly || {})
+      .map(([y, v]) => `${y} 年 ${fmtN(v)} lx·h`).join('，');
+    flash('success', `计划外照明事故已登记并计入实际用光（${ded}）；记录保留、不可改删`);
+  } catch (err) {
+    if (err.status === 409) {
+      // 超额仍生效（顶层含展品详情）或冲突未保存（details）两种 409
+      if (err.data && err.data.incident) {
+        state.detail = err.data;
+        renderDetail();
+        const items = [];
+        (err.data.flaggedPlans || []).forEach((p) =>
+          items.push(`计划 #${p.id}「${esc(p.title)}」已转待复核`));
+        flash('error', err.message, items.length ? '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '');
+        return;
+      }
+      if (err.data && err.data.details) {
+        const det = err.data.details;
+        const items = [];
+        (det.overlappingMeasurements || []).forEach((m) =>
+          items.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}）相交`));
+        (det.overlappingBlackouts || []).forEach((b) =>
+          items.push(`与停灯记录 #${b.id}（${esc(b.start)} ~ ${esc(b.end)}）相交`));
+        (det.overlappingIncidents || []).forEach((x) =>
+          items.push(`与其他事故 #${x.id}（${esc(x.start)} ~ ${esc(x.end)}）相交`));
+        flash('error', err.message, items.length ? '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '');
+        return;
+      }
+    }
+    flash('error', err.message);
   }
 });
 

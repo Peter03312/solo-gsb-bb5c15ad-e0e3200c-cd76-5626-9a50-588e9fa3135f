@@ -198,6 +198,21 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         );
       }
 
+      // 计划外照明事故与实测互斥：后续录入/确认的实测碰到既有事故时段同样拒绝
+      const { rows: incidentClashRows } = await client.query(
+        `SELECT id FROM light_incidents
+          WHERE exhibit_id = $1
+            AND start_ts < $3 AND end_ts > $2
+          LIMIT 1`,
+        [plan.exhibit_id, new Date(start), new Date(end)]
+      );
+      if (incidentClashRows.length > 0) {
+        throw new ConflictError(
+          `实测时段与计划外照明事故 #${incidentClashRows[0].id} 相交，确认被拒绝；事故已按实际用光计量，事故记录不可修改/删除`,
+          { overlappingIncidentId: incidentClashRows[0].id }
+        );
+      }
+
       // 预演确认后的额度占用
       const occupancy = await computeOccupancy(client, plan.exhibit_id, {
         extraMeasurement: {

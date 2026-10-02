@@ -73,6 +73,12 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
   const blackouts = (occupancy.blackouts || []).map(serializeBlackoutViewItem);
   const blackoutDeductionYearly = occupancy.blackoutDeductionYearly || {};
 
+  // 计划外照明事故（保留、不可改删）：逐条附实际按年剂量与对各计划估算的替代；
+  // incidentYearly 为全展品事故实际用光按年合计。仅附加字段，不影响既有消费者。
+  const { serializeIncident } = require('./incidents');
+  const incidents = (occupancy.incidents || []).map(serializeIncident);
+  const incidentYearly = occupancy.incidentYearly || {};
+
   // 已封存年度账册（不可变）：附按当前数据重算的对照差额（仅附加字段，不影响既有消费者）
   const ledgerRows = await listSealedLedgers(client, exhibitId);
   const ledgers = [];
@@ -90,6 +96,8 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     measurements,
     blackouts,
     blackoutDeductionYearly,
+    incidents,
+    incidentYearly,
     ledgers,
   };
 }

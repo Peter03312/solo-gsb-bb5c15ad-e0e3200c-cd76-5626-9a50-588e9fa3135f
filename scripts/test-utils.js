@@ -121,4 +121,46 @@ test('停灯有效扣减 = 落在窗内部分再扣已确认实测覆盖（只�
   assert.strictEqual(mins, 120); // 10-11 与 12-13，共 2h
 });
 
+// 7) 计划外照明事故：实际用光全额计；窗内部分可裁剪到计划窗以替代估算，窗外部分单独存在
+test('事故实际用光按实际照度全额计量（2h × 300lx = 600）', () => {
+  const seg = [{
+    start: dosing.wallToTs('2026-03-01', 10 * 60),
+    end: dosing.wallToTs('2026-03-01', 12 * 60),
+  }];
+  const by = dosing.doseByYear(seg, 300);
+  assert.strictEqual(by.get(2026), 600);
+});
+
+test('事故与计划窗相交部分裁剪出来按计划照度替代估算（2h × 100lx = 200），窗外部分不裁剪', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  // 事故 08:00-12:00：窗内 09:00-12:00（3h），窗外 08:00-09:00 单独计量
+  const hole = { start: dosing.wallToTs('2026-03-01', 8 * 60), end: dosing.wallToTs('2026-03-01', 12 * 60) };
+  const inside = dosing.clipIntervalToWindows(hole, wins);
+  const insideMins = inside.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  assert.strictEqual(insideMins, 180);
+  const replaced = dosing.doseByYear(inside, 100);
+  assert.strictEqual(replaced.get(2026), 300);
+  // 事故全额实际用光 4h × 300 = 1200；净影响 = 1200 − 被替代估算 300 = 900
+  const actual = dosing.doseByYear([hole], 300);
+  assert.strictEqual(actual.get(2026), 1200);
+});
+
+test('事故跨年按墙上自然年拆分（2026-12-31 23:00 → 2027-01-01 01:00，各 1h × 200lx）', () => {
+  const seg = [{
+    start: dosing.wallToTs('2026-12-31', 23 * 60),
+    end: dosing.wallToTs('2027-01-01', 1 * 60),
+  }];
+  const by = dosing.doseByYear(seg, 200);
+  assert.strictEqual(by.get(2026), 200);
+  assert.strictEqual(by.get(2027), 200);
+});
+
+test('事故互斥：相接不相交、相交才算（与实测/停灯同一套区间语义）', () => {
+  const a = { start: dosing.wallToTs('2026-03-01', 10 * 60), end: dosing.wallToTs('2026-03-01', 12 * 60) };
+  const touch = { start: dosing.wallToTs('2026-03-01', 12 * 60), end: dosing.wallToTs('2026-03-01', 13 * 60) };
+  const clash = { start: dosing.wallToTs('2026-03-01', 11 * 60), end: dosing.wallToTs('2026-03-01', 13 * 60) };
+  assert.strictEqual(dosing.intersects(a, touch), false);
+  assert.strictEqual(dosing.intersects(a, clash), true);
+});
+
 console.log(`\n全部 ${passed} 项算法测试通过。`);
